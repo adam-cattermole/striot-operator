@@ -70,6 +70,7 @@ rules:
   - striot.org
   resources:
   - '*'
+  - topologies
   verbs:
   - create
   - delete

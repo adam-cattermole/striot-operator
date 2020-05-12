@@ -1,20 +1,20 @@
 apiVersion: apiextensions.k8s.io/v1beta1
 kind: CustomResourceDefinition
 metadata:
-  name: partitions.striot.org
+  name: topologies.striot.org
 spec:
   group: striot.org
   names:
-    kind: Partition
-    listKind: PartitionList
-    plural: partitions
-    singular: partition
+    kind: Topology
+    listKind: TopologyList
+    plural: topologies
+    singular: topology
   scope: Namespaced
   subresources:
     status: {}
   validation:
     openAPIV3Schema:
-      description: Partition is the Schema for the partitions API
+      description: Topology is the Schema for the topologies API
       properties:
         apiVersion:
           description: 'APIVersion defines the versioned schema of this representation
@@ -29,10 +29,10 @@ spec:
         metadata:
           type: object
         spec:
-          description: PartitionSpec defines the desired state of Partition
+          description: TopologySpec defines the desired state of Topology
           type: object
         status:
-          description: PartitionStatus defines the observed state of Partition
+          description: TopologyStatus defines the observed state of Topology
           type: object
       type: object
   version: v1alpha1

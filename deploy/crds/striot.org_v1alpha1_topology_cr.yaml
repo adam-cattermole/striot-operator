@@ -1,0 +1,12 @@
+apiVersion: striot.org/v1alpha1
+kind: Topology
+metadata:
+  name: example-topology
+spec:
+  partitions:
+    - id: 0
+      image: adamcattermole/striot-src:latest
+      connectType:
+        ingress: "TCP"
+        egress:  "KAFKA"
+  order: [0]
