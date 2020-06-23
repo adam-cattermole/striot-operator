@@ -9,4 +9,14 @@ spec:
       connectType:
         ingress: "TCP"
         egress:  "KAFKA"
-  order: [0]
+    - id: 1
+      image: adamcattermole/striot-link:latest
+      connectType:
+        ingress: "KAFKA"
+        egress:  "TCP"
+    - id: 2
+      image: adamcattermole/striot-sink:latest
+      connectType:
+        ingress: "TCP"
+        egress:  "TCP"
+  order: [0,1,2]

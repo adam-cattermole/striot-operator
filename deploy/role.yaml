@@ -79,3 +79,15 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - kafka.strimzi.io
+  resources:
+  - 'kafkatopics'
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch

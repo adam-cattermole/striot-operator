@@ -2,8 +2,11 @@ package topology
 
 import (
 	"context"
+	"fmt"
 
+	strimziv1beta1 "github.com/adam-cattermole/striot-operator/pkg/apis/strimzi/v1beta1"
 	striotv1alpha1 "github.com/adam-cattermole/striot-operator/pkg/apis/striot/v1alpha1"
+	"github.com/google/uuid"
 	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -131,7 +134,17 @@ func (r *ReconcileTopology) Reconcile(request reconcile.Request) (reconcile.Resu
 
 	// Define a new Deployment Object
 	deployments := createDeployments(instance)
-	for _, d := range *deployments {
+
+	// first create all required kafka topics
+	for _, topic := range deployments.Topics {
+		reqLogger.Info("Creating a new KafkaTopic", "KafkaTopic.Namespace", topic.Namespace, "KafkaTopic.Name", topic.Name)
+		err = r.client.Create(context.TODO(), &topic)
+		if err != nil {
+			reqLogger.Info("Failed to create topic", "err", err)
+		}
+	}
+
+	for i, d := range deployments.Deployments {
 
 		// Set Topology instance as the owner and controller
 		if err = controllerutil.SetControllerReference(instance, &d, r.scheme); err != nil {
@@ -147,15 +160,19 @@ func (r *ReconcileTopology) Reconcile(request reconcile.Request) (reconcile.Resu
 			if err != nil {
 				return reconcile.Result{}, err
 			}
-			// Deployment created successfully - don't requeue
-			return reconcile.Result{}, nil
+			// Deployment created successfully - create relevant service
+			service := deployments.Services[i]
+			reqLogger.Info("Creating a new Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
+			err = r.client.Create(context.TODO(), &service)
+			if err != nil {
+				reqLogger.Info("Failed to create Service", "err", err)
+			}
+			continue
 		} else if err != nil {
 			return reconcile.Result{}, err
 		}
-
 		// Deployment already exists - don't requeue
 		reqLogger.Info("Skip reconcile: Deployment already exists", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
-		return reconcile.Result{}, nil
 	}
 	return reconcile.Result{}, nil
 }
@@ -190,37 +207,157 @@ type DeployInfo struct {
 	Replicas  int32
 }
 
-func createDeployments(cr *striotv1alpha1.Topology) *[]apps.Deployment {
+// KafkaTopicInfo provides additional info for creating kafkatopics
+type KafkaTopicInfo struct {
+	Name        string
+	ClusterName string
+	Namespace   string
+	Replicas    int32
+	Partitions  int32
+}
+
+// Deploy contains all deployments and kafkatopics to deploy
+type Deploy struct {
+	Deployments []apps.Deployment
+	Services    []corev1.Service
+	Topics      []strimziv1beta1.KafkaTopic
+}
+
+func createDeployments(cr *striotv1alpha1.Topology) *Deploy {
 	// name := uuid.New().String()
 	replicas := int32(1)
-	deploy := []apps.Deployment{}
+	deploy := Deploy{
+		Deployments: []apps.Deployment{},
+		Topics:      []strimziv1beta1.KafkaTopic{},
+	}
 
-	for _, p := range cr.Spec.Partitions {
+	partitions := []striotv1alpha1.Partition{}
+	// build partitions map based on Order parameter
+	for _, current := range cr.Spec.Order {
+		// find partition next based on order
+		for _, p := range cr.Spec.Partitions {
+			if p.ID == current {
+				partitions = append(partitions, p)
+				break
+			}
+		}
+	}
+
+	for i, partition := range partitions {
+		envTemp := map[string]string{}
+		// setup deploy info
 		di := DeployInfo{
-			Name:      "striot-node-" + string(p.ID),
+			Name:      "striot-node-" + fmt.Sprint(partition.ID),
 			Namespace: cr.Namespace,
 			Replicas:  replicas,
 		}
-		deploy = append(deploy, *createStriotDeployment(&di, &p))
-	}
+		// create connection specific info
+		envTemp["STRIOT_NODE_NAME"] = di.Name
 
+		// SETUP INGRESS
+		switch partition.ConnectType.Ingress {
+		case striotv1alpha1.ProtocolTCP:
+			envTemp["STRIOT_INGRESS_TYPE"] = striotv1alpha1.ProtocolTCP.String()
+			if i == 0 {
+				// SOURCE
+				envTemp["STRIOT_INGRESS_HOST"] = ""
+				envTemp["STRIOT_INGRESS_PORT"] = ""
+			} else {
+				envTemp["STRIOT_INGRESS_HOST"] = "striot-node-" + fmt.Sprint(partitions[i-1].ID)
+				envTemp["STRIOT_INGRESS_PORT"] = "9001"
+			}
+
+		case striotv1alpha1.ProtocolKafka:
+			envTemp["STRIOT_INGRESS_TYPE"] = striotv1alpha1.ProtocolKafka.String()
+			envTemp["STRIOT_INGRESS_HOST"] = "my-cluster-kafka-bootstrap"
+			envTemp["STRIOT_INGRESS_PORT"] = "9092"
+			envTemp["STRIOT_INGRESS_KAFKA_TOPIC"] = deploy.Topics[len(deploy.Topics)-1].Name
+			envTemp["STRIOT_INGRESS_KAFKA_CON_GROUP"] = "striot-con-group"
+		case striotv1alpha1.ProtocolMQTT:
+		default:
+		}
+
+		// SETUP EGRESS
+		switch partition.ConnectType.Egress {
+		case striotv1alpha1.ProtocolTCP:
+			envTemp["STRIOT_EGRESS_TYPE"] = striotv1alpha1.ProtocolTCP.String()
+			if len(partitions)-1 == i {
+				// SINK
+				envTemp["STRIOT_EGRESS_HOST"] = ""
+				envTemp["STRIOT_EGRESS_PORT"] = ""
+			} else {
+				envTemp["STRIOT_EGRESS_HOST"] = "striot-node-" + fmt.Sprint(partitions[i+1].ID)
+				envTemp["STRIOT_EGRESS_PORT"] = "9001"
+			}
+		case striotv1alpha1.ProtocolKafka:
+			envTemp["STRIOT_EGRESS_TYPE"] = striotv1alpha1.ProtocolKafka.String()
+			kti := KafkaTopicInfo{
+				Name:        "striot-topic-" + uuid.New().String(),
+				ClusterName: "my-cluster",
+				Namespace:   cr.Namespace,
+				Replicas:    1,
+				Partitions:  64,
+			}
+			envTemp["STRIOT_EGRESS_HOST"] = "my-cluster-kafka-bootstrap"
+			envTemp["STRIOT_EGRESS_PORT"] = "9092"
+			envTemp["STRIOT_EGRESS_KAFKA_TOPIC"] = kti.Name
+			envTemp["STRIOT_EGRESS_KAFKA_CON_GROUP"] = "none"
+			deploy.Topics = append(deploy.Topics, *createKafkaTopic(&kti))
+		case striotv1alpha1.ProtocolMQTT:
+		default:
+		}
+		// Set buffer size
+		envTemp["STRIOT_CHAN_SIZE"] = "10"
+		// Create deployment with info
+		env := []corev1.EnvVar{}
+
+		for k, v := range envTemp {
+			env = append(env, corev1.EnvVar{Name: k, Value: v})
+		}
+		labels := map[string]string{
+			"app":    di.Name,
+			"all":    "striot",
+			"striot": "monitor",
+		}
+		deploy.Deployments = append(deploy.Deployments, *createStriotDeployment(&di, &partition, &env, &labels))
+		deploy.Services = append(deploy.Services, *createStriotService(&di, &labels))
+	}
 	return &deploy
 }
 
-func createStriotDeployment(di *DeployInfo, part *striotv1alpha1.Partition) *apps.Deployment {
-
-	labels := map[string]string{
-		"app":    di.Name,
-		"all":    "striot",
-		"striot": "monitor",
+func createStriotService(di *DeployInfo, labels *map[string]string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      di.Name,
+			Namespace: di.Namespace,
+			Labels:    *labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{
+					Name:     "striot",
+					Port:     9001,
+					Protocol: corev1.ProtocolTCP,
+				},
+				{
+					Name:     "prom",
+					Port:     8080,
+					Protocol: corev1.ProtocolTCP,
+				},
+			},
+			Selector: map[string]string{"app": di.Name},
+		},
 	}
-	env := *generateEnv(part)
 
+}
+
+func createStriotDeployment(di *DeployInfo, part *striotv1alpha1.Partition, env *[]corev1.EnvVar, labels *map[string]string) *apps.Deployment {
 	return &apps.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      di.Name,
 			Namespace: di.Namespace,
-			Labels:    labels,
+			Labels:    *labels,
 		},
 		Spec: apps.DeploymentSpec{
 			Replicas: &di.Replicas,
@@ -231,7 +368,7 @@ func createStriotDeployment(di *DeployInfo, part *striotv1alpha1.Partition) *app
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
+					Labels: *labels,
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -250,7 +387,7 @@ func createStriotDeployment(di *DeployInfo, part *striotv1alpha1.Partition) *app
 									Protocol:      corev1.ProtocolTCP,
 								},
 							},
-							Env: env,
+							Env: *env,
 						},
 					},
 				},
@@ -259,31 +396,17 @@ func createStriotDeployment(di *DeployInfo, part *striotv1alpha1.Partition) *app
 	}
 }
 
-func generateEnv(cr *striotv1alpha1.Partition) *[]corev1.EnvVar {
-
-	test := map[string]string{
-		"STRIOT_NODE_NAME":              "striot-src",
-		"STRIOT_INGRESS_TYPE":           striotv1alpha1.ProtocolTCP.String(),
-		"STRIOT_INGRESS_HOST":           "",
-		"STRIOT_INGRESS_PORT":           "",
-		"STRIOT_EGRESS_TYPE":            striotv1alpha1.ProtocolKafka.String(),
-		"STRIOT_EGRESS_HOST":            "my-cluster-kafka-bootstrap",
-		"STRIOT_EGRESS_PORT":            "9092",
-		"STRIOT_EGRESS_KAFKA_TOPIC":     "striot-queue",
-		"STRIOT_EGRESS_KAFKA_CON_GROUP": "none",
-		"STRIOT_CHAN_SIZE":              "10",
+func createKafkaTopic(kti *KafkaTopicInfo) *strimziv1beta1.KafkaTopic {
+	return &strimziv1beta1.KafkaTopic{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kti.Name,
+			Namespace: kti.Namespace,
+			Labels: map[string]string{
+				"strimzi.io/cluster": kti.ClusterName,
+			}},
+		Spec: strimziv1beta1.KafkaTopicSpec{
+			Replicas:   kti.Replicas,
+			Partitions: kti.Partitions,
+		},
 	}
-	env := []corev1.EnvVar{}
-
-	for k, v := range test {
-		env = append(env, corev1.EnvVar{Name: k, Value: v})
-	}
-
-	return &env
 }
-
-// TODO:
-//		- Create a function that iterates over Partitions and creates all necessary containers/deploys
-// 		- Find a way to give default values to the containers depending on the ingress/egress types
-//		- Find out how to interface with the strimzi operator to create the required topics
-//		- Check how to create unique hashes in Go so that we can name the topics appropriately - DONE
