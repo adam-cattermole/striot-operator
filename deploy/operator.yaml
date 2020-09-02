@@ -13,6 +13,15 @@ spec:
         name: striot-operator
     spec:
       serviceAccountName: striot-operator
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: node-restriction.kubernetes.io/edge
+                  operator: NotIn
+                  values:
+                  - "true"
       containers:
         - name: striot-operator
           # Replace this with the built image name

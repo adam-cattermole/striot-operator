@@ -3,9 +3,11 @@ package topology
 import (
 	"context"
 	"fmt"
+	"time"
 
 	strimziv1beta1 "github.com/adam-cattermole/striot-operator/pkg/apis/strimzi/v1beta1"
 	striotv1alpha1 "github.com/adam-cattermole/striot-operator/pkg/apis/striot/v1alpha1"
+	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -144,8 +146,16 @@ func (r *ReconcileTopology) Reconcile(request reconcile.Request) (reconcile.Resu
 		}
 	}
 
+	var link = apps.Deployment{}
+	var linkService = corev1.Service{}
+
 	for i, d := range deployments.Deployments {
 
+		// VERY HACKY WARNING
+		if d.Name == "striot-node-1" {
+			link = d
+			linkService = deployments.Services[i]
+		}
 		// Set Topology instance as the owner and controller
 		if err = controllerutil.SetControllerReference(instance, &d, r.scheme); err != nil {
 			return reconcile.Result{}, err
@@ -174,7 +184,106 @@ func (r *ReconcileTopology) Reconcile(request reconcile.Request) (reconcile.Resu
 		// Deployment already exists - don't requeue
 		reqLogger.Info("Skip reconcile: Deployment already exists", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
 	}
+
+	// POLL REDIS
+	pollRedis()
+
+	// DELETE / SHUTDOWN LINK
+	found := &apps.Deployment{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: link.Name, Namespace: link.Namespace}, found)
+	if err == nil {
+		reqLogger.Info("Found link deployment", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+		err = r.client.Delete(context.TODO(), found)
+		if err != nil {
+			reqLogger.Info("Error deleting deployment", "err", err)
+		}
+	}
+	err = nil
+	foundService := &corev1.Service{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: linkService.Name, Namespace: linkService.Namespace}, foundService)
+	if err == nil {
+		reqLogger.Info("Found link service", "Service.Namespace", foundService.Namespace, "Service.Name", foundService.Name)
+		err = r.client.Delete(context.TODO(), foundService)
+		if err != nil {
+			reqLogger.Info("Error deleting service", "err", err)
+		}
+	}
+
+	// CREATE LINK2
+
+	//update env
+	envTemp := map[string]string{}
+	envTemp["STRIOT_STATE_INIT"] = "True"
+	envTemp["STRIOT_STATE_KEY"] = "sdj123914k"
+	env := &link.Spec.Template.Spec.Containers[0].Env
+	for k, v := range envTemp {
+		*env = append(*env, corev1.EnvVar{Name: k, Value: v})
+	}
+
+	// create deploy + service
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: link.Name, Namespace: link.Namespace}, found)
+	if err != nil && errors.IsNotFound(err) {
+		reqLogger.Info("Creating a new Deployment", "Deployment.Namespace", link.Namespace, "Deployment.Name", link.Name)
+		err = r.client.Create(context.TODO(), &link)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		// Deployment created successfully - create relevant service
+		reqLogger.Info("Creating a new Service", "Service.Namespace", linkService.Namespace, "Service.Name", linkService.Name)
+		err = r.client.Create(context.TODO(), &linkService)
+		if err != nil {
+			reqLogger.Info("Failed to create Service", "err", err)
+		}
+	} else if err != nil {
+		return reconcile.Result{}, err
+	}
+	// Deployment already exists - don't requeue????
+	reqLogger.Info("Skip reconcile: Deployment already exists", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+
 	return reconcile.Result{}, nil
+}
+
+func pollRedis() {
+	var ctx = context.Background()
+	// create connect(?)
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "striot-redis:6379",
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
+
+	numKeys := 0
+
+	for numKeys == 0 {
+		time.Sleep(time.Duration(50) * time.Millisecond)
+		val, err := rdb.Keys(ctx, "*").Result()
+		if err != nil {
+			log.Info("Redis error: ", "err", err)
+		} else {
+			log.Info("redis keys", "keys", val)
+		}
+		numKeys = len(val)
+	}
+
+	// err := rdb.Set(ctx, "key", "value", 0).Err()
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	// val, err := rdb.Get(ctx, "key").Result()
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// fmt.Println("key", val)
+
+	// val2, err := rdb.Get(ctx, "key2").Result()
+	// if err == redis.Nil {
+	// 	fmt.Println("key2 does not exist")
+	// } else if err != nil {
+	// 	panic(err)
+	// } else {
+	// 	fmt.Println("key2", val2)
+	// }
 }
 
 // newPodForCR returns a busybox pod with the same name/namespace as the cr
@@ -368,6 +477,7 @@ func createStriotDeployment(di *DeployInfo, part *striotv1alpha1.Partition, env 
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
+					Name:   di.Name,
 					Labels: *labels,
 				},
 				Spec: corev1.PodSpec{
